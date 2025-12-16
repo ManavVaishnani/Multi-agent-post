@@ -8,9 +8,8 @@ use App\Neuron\Agents\AnalystAgent;
 use App\Neuron\Agents\LinkedinAgent;
 use Illuminate\Http\Request;
 use NeuronAI\Chat\Messages\UserMessage;
-use GuzzleHttp\Exception\ClientException;
-use Illuminate\Support\Facades\Log;
-use Exception;
+use App\Jobs\RunAgentPipeline;
+use Illuminate\Support\Str;
 
 class MultiAgentController extends Controller
 {
@@ -24,74 +23,28 @@ class MultiAgentController extends Controller
     {
         $topic = $request->input('topic'); // e.g., "Future of AI in Marketing"
 
-        // 1. RESEARCHER (with retry on 429)
-        $researcher = ResearcherAgent::make();
-        $researchResponse = $this->callAgentWithRetries($researcher, new UserMessage("Research this topic deeply: " . $topic));
-        $rawResearch = $researchResponse->getContent();
+        // Create a run id and dispatch the pipeline job so the frontend can poll for results.
+        $runId = (string) Str::uuid();
 
-        sleep(5);
+        RunAgentPipeline::dispatch($topic, $runId);
 
-        // 2. ANALYST (with retry on 429)
-        $analyst = AnalystAgent::make();
-        $analysisResponse = $this->callAgentWithRetries($analyst, new UserMessage("Verify and structure this raw research data: \n\n" . $rawResearch));
-        $validatedContent = $analysisResponse->getContent();
-
-        sleep(5);
-        
-        // 3. CREATOR (with retry on 429)
-        $creator = LinkedinAgent::make();
-        $finalResponse = $this->callAgentWithRetries($creator, new UserMessage("Create a LinkedIn post and slide deck from this analysis: \n\n" . $validatedContent));
-
-        $finalOutput = json_decode($finalResponse->getContent(), true);
-
-        return view('agents.dashboard', [
-            'topic' => $topic,
-            'research' => $rawResearch,
-            'analysis' => $validatedContent,
-            'final' => $finalOutput
-        ]);
+        return response()->json(['run_id' => $runId], 202);
     }
 
     /**
-     * Call an agent's chat method with simple retry/backoff for 429 responses.
-     *
-     * @param  mixed  $agent  An agent instance with a ->chat(UserMessage $msg) method
-     * @param  UserMessage  $message
-     * @param  int  $maxAttempts
-     * @return mixed
-     *
-     * @throws Exception
+     * Return the run state JSON for the frontend poller.
      */
-    protected function callAgentWithRetries(mixed $agent, UserMessage $message, int $maxAttempts = 3)
+    public function getResult(string $runId)
     {
-        $attempt = 0;
+        $path = storage_path('app/agent-runs/'.$runId.'.json');
 
-        while (true) {
-            $attempt++;
-
-            try {
-                return $agent->chat($message);
-            } catch (ClientException $e) {
-                $status = null;
-                if ($e->getResponse() !== null) {
-                    $status = (int) $e->getResponse()->getStatusCode();
-                }
-
-                // If rate limited, retry with exponential backoff up to $maxAttempts
-                if ($status === 429 && $attempt < $maxAttempts) {
-                    $wait = (int) pow(2, $attempt); // 2, 4, 8 ... seconds
-                    Log::warning("Generative API returned 429; retrying attempt {$attempt}/{$maxAttempts} after {$wait}s");
-                    sleep($wait);
-                    continue;
-                }
-
-                // Not a 429 or max attempts reached — rethrow so caller can handle
-                Log::error('Generative API client exception', ['exception' => $e]);
-                throw $e;
-            } catch (Exception $e) {
-                Log::error('Generative API general exception', ['exception' => $e]);
-                throw $e;
-            }
+        if (! file_exists($path)) {
+            return response()->json(['status' => 'pending'], 202);
         }
+
+        $content = file_get_contents($path);
+        $data = json_decode($content, true) ?? ['status' => 'failed', 'error' => 'Corrupt run data'];
+
+        return response()->json($data);
     }
 }

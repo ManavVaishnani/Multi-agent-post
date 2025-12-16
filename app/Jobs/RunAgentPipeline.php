@@ -7,6 +7,8 @@ use App\Neuron\Agents\LinkedinAgent;
 use App\Neuron\Agents\ResearcherAgent;
 use Exception;
 use GuzzleHttp\Exception\ClientException;
+use NeuronAI\Exceptions\ToolMaxTriesException;
+use Throwable;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -34,10 +36,55 @@ class RunAgentPipeline implements ShouldQueue
         $this->persist(['status' => 'running', 'topic' => $this->topic]);
 
         try {
-            $research = $this->callAgentWithRetries(
-                ResearcherAgent::make(),
-                new UserMessage("Research this topic deeply: {$this->topic}")
-            )->getContent();
+            // Try running the Researcher agent. If the provider returns 429 repeatedly,
+            // fall back to a direct search+fetch approach so the pipeline can continue.
+            try {
+                $research = $this->callAgentWithRetries(
+                    ResearcherAgent::make(),
+                    new UserMessage("Research this topic deeply: {$this->topic}")
+                )->getContent();
+            } catch (ClientException $e) {
+                $status = null;
+                if ($e->getResponse() !== null) {
+                    $status = (int) $e->getResponse()->getStatusCode();
+                }
+
+                if ($status === 429) {
+                    Log::warning('Researcher agent provider returned 429; using direct search fallback', ['run_id' => $this->runId]);
+
+                    // Use direct HTTP search and fetch the top links (up to 10)
+                    $raw = [];
+                    try {
+                        $searchJson = \App\Neuron\Tools\GoogleSearchTool::fetchResults($this->topic);
+                        $searchData = json_decode($searchJson, true) ?? ['findings' => []];
+
+                        $candidates = $searchData['findings'] ?? [];
+
+                        foreach (array_slice($candidates, 0, 10) as $item) {
+                            $url = $item['source_url'] ?? null;
+                            if (! $url) continue;
+
+                            $fetched = \App\Neuron\Tools\FetchUrlTool::fetchUrl($url);
+                            $fetchedData = json_decode($fetched, true) ?? ['url' => $url];
+
+                            $raw[] = [
+                                'fact' => $item['fact'] ?? null,
+                                'context' => $item['context'] ?? null,
+                                'source_url' => $url,
+                                'excerpt' => $fetchedData['excerpt'] ?? null,
+                                'title' => $fetchedData['title'] ?? null,
+                            ];
+                        }
+
+                        $research = json_encode(['findings' => $raw], JSON_PRETTY_PRINT);
+                    } catch (\Throwable $inner) {
+                        Log::error('Fallback search failed', ['exception' => $inner]);
+                        throw $e; // rethrow original to let outer handler persist failure
+                    }
+                } else {
+                    throw $e;
+                }
+            }
 
             $this->persist(['status' => 'research_completed', 'research' => $research]);
 
@@ -70,14 +117,24 @@ class RunAgentPipeline implements ShouldQueue
                 'final_raw' => $finalRaw,
             ]);
         } catch (Exception $e) {
+            // Provide clearer error messages for quota/tool-related failures
+            $friendly = $e->getMessage();
+
+            if ($e instanceof ClientException && $e->getResponse() !== null && (int) $e->getResponse()->getStatusCode() === 429) {
+                $friendly = 'Quota exceeded: Generative API returned 429 Too Many Requests. Check your Google Cloud billing and API quotas.';
+            } elseif ($e instanceof ToolMaxTriesException) {
+                $friendly = 'Tool retries exhausted: ' . $e->getMessage();
+            }
+
             Log::error('RunAgentPipeline failed', [
                 'run_id' => $this->runId,
                 'exception' => $e,
+                'friendly' => $friendly,
             ]);
 
             $this->persist([
                 'status' => 'failed',
-                'error' => $e->getMessage(),
+                'error' => $friendly,
             ]);
 
             $this->fail($e);
@@ -87,8 +144,10 @@ class RunAgentPipeline implements ShouldQueue
     /**
      * Call an agent's chat method with simple retry/backoff for 429 responses.
      */
-    protected function callAgentWithRetries(mixed $agent, UserMessage $message, int $maxAttempts = 3)
+    protected function callAgentWithRetries(mixed $agent, UserMessage $message, int $maxAttempts = null)
     {
+        $maxAttempts = $maxAttempts ?? (int) env('AGENT_MAX_ATTEMPTS', 6);
+
         $attempt = 0;
 
         while (true) {
@@ -103,16 +162,27 @@ class RunAgentPipeline implements ShouldQueue
                     $status = (int) $e->getResponse()->getStatusCode();
                 }
 
+                // Exponential backoff with small jitter for 429 responses
                 if ($status === 429 && $attempt < $maxAttempts) {
-                    $wait = (int) pow(2, $attempt);
+                    $base = (int) pow(2, $attempt);
+                    $jitter = random_int(0, 3);
+                    $wait = min(60, $base + $jitter);
                     Log::warning("Generative API returned 429; retrying attempt {$attempt}/{$maxAttempts} after {$wait}s");
                     sleep($wait);
                     continue;
                 }
 
-                Log::error('Generative API client exception', ['exception' => $e]);
+                if ($status === 429) {
+                    Log::error('Generative API quota likely exceeded (429)', ['attempt' => $attempt, 'maxAttempts' => $maxAttempts, 'exception' => $e]);
+                } else {
+                    Log::error('Generative API client exception', ['exception' => $e]);
+                }
+
                 throw $e;
-            } catch (Exception $e) {
+            } catch (ToolMaxTriesException $e) {
+                Log::error('Tool max tries exceeded', ['exception' => $e]);
+                throw $e;
+            } catch (Throwable $e) {
                 Log::error('Generative API general exception', ['exception' => $e]);
                 throw $e;
             }

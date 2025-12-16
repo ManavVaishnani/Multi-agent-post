@@ -23,7 +23,8 @@ class GoogleSearchTool
                 description: 'The search topic or question.',
                 required: true
             )
-        )->setCallable(function (string $query) {
+        )->setMaxTries(3)
+        ->setCallable(function (string $query) {
             static $invocationCount = 0;
             static $cache = [];
 
@@ -81,7 +82,7 @@ class GoogleSearchTool
             $organic = $payload['organic'] ?? [];
 
             $findings = collect($organic)
-                ->take(8)
+                ->take(10)
                 ->map(function (array $item) {
                     $title = $item['title'] ?? 'Untitled';
                     $snippet = $item['snippet'] ?? ($item['description'] ?? '');
@@ -93,16 +94,74 @@ class GoogleSearchTool
                         'source_url' => $link,
                     ];
                 })->values()->all();
+            $result = json_encode([
+                'findings' => $findings,
+                'provider' => 'serper.dev',
+            ], JSON_PRETTY_PRINT);
+
+            // cache and return
+            $cache[$query] = $result;
+            return $result;
+        });
+    }
+
+    /**
+     * Direct helper to fetch search results (used by fallback pipeline).
+     */
+    public static function fetchResults(string $query): string
+    {
+        $apiKey = env('SERPER_API_KEY');
+
+        if (empty($apiKey)) {
+            return json_encode([
+                'findings' => [],
+                'error' => 'SERPER_API_KEY is missing in environment.',
+            ], JSON_PRETTY_PRINT);
+        }
+
+        try {
+            $response = \Illuminate\Support\Facades\Http::withHeaders([
+                'X-API-KEY' => $apiKey,
+                'Content-Type' => 'application/json',
+            ])->post('https://google.serper.dev/search', ['q' => $query]);
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('Serper search failed (fallback)', ['exception' => $e]);
 
             return json_encode([
-                'findings' => $findings,
-                'provider' => 'serper.dev',
+                'findings' => [],
+                'error' => 'Network error while calling search provider.',
             ], JSON_PRETTY_PRINT);
-            $cache[$query] = json_encode([
-                'findings' => $findings,
-                'provider' => 'serper.dev',
+        }
+
+        if ($response->failed()) {
+            \Illuminate\Support\Facades\Log::warning('Serper search non-200 response (fallback)', [
+                'status' => $response->status(),
+                'body' => $response->body(),
+            ]);
+
+            return json_encode([
+                'findings' => [],
+                'error' => 'Search provider returned an error.',
             ], JSON_PRETTY_PRINT);
-            return $cache[$query];
-        });
+        }
+
+        $payload = $response->json();
+        $organic = $payload['organic'] ?? [];
+
+        $findings = collect($organic)
+            ->take(10)
+            ->map(function (array $item) {
+                $title = $item['title'] ?? 'Untitled';
+                $snippet = $item['snippet'] ?? ($item['description'] ?? '');
+                $link = $item['link'] ?? ($item['url'] ?? '');
+
+                return [
+                    'fact' => $title,
+                    'context' => \Illuminate\Support\Str::limit($snippet, 240),
+                    'source_url' => $link,
+                ];
+            })->values()->all();
+
+        return json_encode(['findings' => $findings, 'provider' => 'serper.dev'], JSON_PRETTY_PRINT);
     }
 }
